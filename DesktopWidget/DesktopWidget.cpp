@@ -22,7 +22,7 @@
 #include <vector>
 #include <shlwapi.h>
 #pragma comment(lib, "Shlwapi.lib")
-
+    
 #include <comdef.h>
 #include <Wbemidl.h>
 #pragma comment(lib, "wbemuuid.lib")
@@ -42,7 +42,6 @@ int g_notifyFrames = 0;
 ULONG_PTR g_gdiplusToken;
 HWINEVENTHOOK g_hEventHook = NULL;
 FocusEngine* g_focusEngine = nullptr;
-
 // -------------------------------------------------------------------------
 // Hardware Monitor Class
 // -------------------------------------------------------------------------
@@ -263,7 +262,7 @@ public:
 WmiTemperatureMonitor* g_wmiMonitor = nullptr;
 
 // -------------------------------------------------------------------------
-// Path Resolution
+// Path Resolution (Read-Only Application Assets)
 // -------------------------------------------------------------------------
 std::wstring GetAssetsPath(const std::wstring& subFolder) {
     wchar_t path[MAX_PATH];
@@ -273,6 +272,21 @@ std::wstring GetAssetsPath(const std::wstring& subFolder) {
     std::wstring assetsPath = path;
     assetsPath += L"\\assets\\" + subFolder;
     return assetsPath;
+}
+
+// -------------------------------------------------------------------------
+// AppData Resolution (Read-Write User Context)
+// -------------------------------------------------------------------------
+#include <shlobj.h>
+std::wstring GetAppDataPath(const std::wstring& filename) {
+    wchar_t path[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, path))) {
+        std::wstring appDataFolder = std::wstring(path) + L"\\DeepWorkDesktop";
+        CreateDirectoryW(appDataFolder.c_str(), NULL);
+        return appDataFolder + L"\\" + filename;
+    }
+    // Fallback natively to relative localized boundaries if UAC context fails
+    return GetAssetsPath(filename);
 }
 
 // -------------------------------------------------------------------------
@@ -533,13 +547,15 @@ void DrawFocusWidget(HWND hWnd) {
             int hr = g_focusEngine->earnedTokensSeconds / 3600;
             int mn = (g_focusEngine->earnedTokensSeconds % 3600) / 60;
             swprintf_s(buf, L"%02d h %02d m", hr, mn);
-            DrawProgressBar(graphics, &fontItem, L"Earned Tokens", buf, x, y, barWidth, 100.0f, Color(255, 50, 200, 255), Color(255, 50, 200, 255));
+            float earnedPct = min(((float)g_focusEngine->earnedTokensSeconds / (24.0f * 3600.0f)) * 100.0f, 100.0f);
+            DrawProgressBar(graphics, &fontItem, L"Earned Tokens", buf, x, y, barWidth, earnedPct, Color(255, 50, 200, 255), Color(255, 50, 200, 255));
             y += spacing;
             
             int nsfwHr = g_focusEngine->nsfwRemainingSeconds / 3600;
             int nsfwMn = (g_focusEngine->nsfwRemainingSeconds % 3600) / 60;
             swprintf_s(buf, L"%02d h %02d m", nsfwHr, nsfwMn);
-            DrawProgressBar(graphics, &fontItem, L"NSFW Allowance", buf, x, y, barWidth, 100.0f, Color(255, 200, 50, 100), Color(255, 200, 50, 100));
+            float nsfwPct = min(((float)g_focusEngine->nsfwRemainingSeconds / 7200.0f) * 100.0f, 100.0f);
+            DrawProgressBar(graphics, &fontItem, L"NSFW Allowance", buf, x, y, barWidth, nsfwPct, Color(255, 200, 50, 100), Color(255, 200, 50, 100));
             y += spacing + 10.0f;
 
             graphics.DrawString(L"ACTIVE SCREEN TIME", -1, &fontTitle, PointF(20.0f, y), &accentBrush);
@@ -753,11 +769,18 @@ void CALLBACK WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, 
             if (wcscmp(className, L"Progman") == 0 || wcscmp(className, L"WorkerW") == 0) {
                 if (g_hWnd) SetWindowPos(g_hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                 if (g_hFocusWidgetWnd) SetWindowPos(g_hFocusWidgetWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            } else if (wcscmp(className, L"#32768") == 0 || 
+                       wcscmp(className, L"tooltips_class32") == 0 || 
+                       wcscmp(className, L"SysListView32") == 0 ||
+                       wcscmp(className, L"XamlExplorerHostIslandWindow") == 0) {
+                // Ignore Context Menus, Windows 11 Popups, Tooltips, and internal icon lists natively
+                return;
             } else {
-                if (hwnd == g_hWnd || hwnd == g_hFocusWidgetWnd || hwnd == g_hDotWnd) return;
+                if (hwnd == g_hWnd || hwnd == g_hFocusWidgetWnd || hwnd == g_hDotWnd || hwnd == g_hNotifyWnd) return;
                 
-                if (g_hWnd) SetWindowPos(g_hWnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                if (g_hFocusWidgetWnd) SetWindowPos(g_hFocusWidgetWnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                // Strip TOPMOST status without forcefully banishing the layer below the WorkerW Desktop Wallpaper natively
+                if (g_hWnd) SetWindowPos(g_hWnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                if (g_hFocusWidgetWnd) SetWindowPos(g_hFocusWidgetWnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             }
         }
     }
@@ -768,16 +791,20 @@ void CALLBACK WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, 
 // -------------------------------------------------------------------------
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
-        case WM_CREATE:
+        case WM_CREATE: {
             // Initialize Hardware Monitor
             g_hwMonitor = new HardwareMonitor();
             g_wmiMonitor = new WmiTemperatureMonitor();
-            g_focusEngine = new FocusEngine();
+            
+            std::wstring enginePath = GetAppDataPath(L"engine_state.bin");
+            g_focusEngine = new FocusEngine(enginePath);
+            
             // 1) 1000ms strictly event-driven Timer - keeps CPU at 0%
             SetTimer(hWnd, 1, 1000, NULL);
             // 2) Initial Draw
             DrawWidget(hWnd);
             break;
+        }
 
         case WM_TIMER:
             if (wParam == 1) {
@@ -853,6 +880,24 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 }
 
 // -------------------------------------------------------------------------
+// Startup Registry Injection
+// -------------------------------------------------------------------------
+void EnableAutoStart() {
+    wchar_t path[MAX_PATH];
+    GetModuleFileNameW(NULL, path, MAX_PATH);
+
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        std::wstring quotedPath = L"\"";
+        quotedPath += path;
+        quotedPath += L"\"";
+        
+        RegSetValueExW(hKey, L"DeepWorkDesktop", 0, REG_SZ, (const BYTE*)quotedPath.c_str(), (DWORD)((quotedPath.length() + 1) * sizeof(wchar_t)));
+        RegCloseKey(hKey);
+    }
+}
+
+// -------------------------------------------------------------------------
 // Application Entry Point: wWinMain
 // -------------------------------------------------------------------------
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
@@ -866,6 +911,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     // 1) Initialize GDI+
     GdiplusStartupInput gdiplusStartupInput;
     GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, NULL);
+
+    // Lock Application to Windows Boot Sequence natively
+    EnableAutoStart();
 
     // Initialize custom fonts
     InitializeFonts();

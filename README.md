@@ -1,4 +1,4 @@
-# AeroDynamics Native Desktop Widget Suite
+# DeepWork Desktop
 
 A high-performance, uniquely native Win32/GDI+ desktop widget suite engineered strictly in lightweight C++! 
 It seamlessly marries real-time zero-overhead hardware monitoring with an aggressive token-economy Focus Engine designed specifically for power users.
@@ -16,6 +16,7 @@ It seamlessly marries real-time zero-overhead hardware monitoring with an aggres
 - **The Ban Hammer**: When you expend all earned time and try to inspect a distraction, the Focus Engine dynamically injects a synthesized `CTRL + W` direct keyboard injection keystroke to explicitly nuke the exact browser tab violating the rules, safely protecting your active research tabs natively.
 - **AFK Suspension**: Automatically integrates native `GetLastInputInfo` hooks to completely freeze token generation securely the moment you walk away or idle dynamically for two straight minutes.
 - **Persistent Analytics Dashboard**: Automatically catalogs every non-AFK millisecond spent inside every app or domain natively, then sorts and populates the Top 4 screen-time metrics distinctly beside the Master Screen Time Benchmark gradient!
+- **Advanced Anti-Cheat**: Employs an uncompromising retroactive heartbeat rollback loop to block "Thinking Time" penalties, and implements an active 60-point bounded mouse trajectory algorithm to instantly recognize and freeze out hardware/software "Mouse Jigglers".
 
 ## Architecture
 
@@ -28,8 +29,3 @@ Architected specifically across 3 independent, Z-order synchronized `WS_EX_LAYER
 1. Open up Visual Studio natively (built with MSVC standard pipelines in x64 Debug/Release context).
 2. All libraries linked via pragmas including `uiautomationcore.lib`, `pdh.lib`, and `wbemuuid.lib`.
 3. Simply drop any localized `.ttf` or `.otf` assets right into `\assets\fonts\` directory relative natively to the exported `.exe` context to automatically populate and mount custom typography pipelines.
-
-## Development Branches
-- `main` strictly locked for verified, fully-functional desktop production deployments.
-- `experimental` mapping deep-system architectural rewrites.
-- `new_feature` isolated pipeline branch for live logic mapping and testing bounds.
