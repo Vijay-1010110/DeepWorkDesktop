@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="DesktopWidget/DesktopWidget.vcxproj" Id="29ecbbf8-5409-4ac0-b8c8-c63ea9b99090" />
+</Solution>
