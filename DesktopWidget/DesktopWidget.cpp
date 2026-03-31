@@ -27,14 +27,21 @@
 #include <Wbemidl.h>
 #pragma comment(lib, "wbemuuid.lib")
 
+#include "FocusEngine.h"
+
 using namespace Gdiplus;
 
 // -------------------------------------------------------------------------
 // Global Variables
 // -------------------------------------------------------------------------
 HWND g_hWnd = NULL;
+HWND g_hDotWnd = NULL;
+HWND g_hFocusWidgetWnd = NULL;
+HWND g_hNotifyWnd = NULL;
+int g_notifyFrames = 0;
 ULONG_PTR g_gdiplusToken;
 HWINEVENTHOOK g_hEventHook = NULL;
+FocusEngine* g_focusEngine = nullptr;
 
 // -------------------------------------------------------------------------
 // Hardware Monitor Class
@@ -343,7 +350,7 @@ void AddRoundRect(GraphicsPath* path, const RectF& rect, float radius) {
 
 void DrawProgressBar(Graphics& g, Gdiplus::Font* font, const WCHAR* label, const WCHAR* valueText, 
                      float x, float y, float width, float percentage,
-                     Color colorStart, Color colorEnd) {
+                     Color colorStart, Color colorEnd, float barHeight = 8.0f) {
     
     // Draw Label (Left Aligned)
     SolidBrush textBrush(Color(255, 255, 255, 255));
@@ -357,7 +364,6 @@ void DrawProgressBar(Graphics& g, Gdiplus::Font* font, const WCHAR* label, const
 
     // Draw Bar Background Track
     float barY = y + 20.0f;
-    float barHeight = 8.0f;
     RectF bgRect(x, barY, width, barHeight);
     
     GraphicsPath bgPath;
@@ -380,12 +386,227 @@ void DrawProgressBar(Graphics& g, Gdiplus::Font* font, const WCHAR* label, const
 }
 
 // -------------------------------------------------------------------------
+// Dot Indicator Window
+// -------------------------------------------------------------------------
+LRESULT CALLBACK DotWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message == WM_NCHITTEST) return HTTRANSPARENT;
+    return DefWindowProc(hWnd, message, wParam, lParam);
+}
+
+void DrawDotIndicator(HWND hDotWnd, FocusState state) {
+    if (!hDotWnd) return;
+    int size = 16;
+    HDC hdcScreen = GetDC(NULL);
+    HDC hdcMem = CreateCompatibleDC(hdcScreen);
+    HBITMAP hBitmap = CreateCompatibleBitmap(hdcScreen, size, size);
+    HBITMAP hOldBitmap = (HBITMAP)SelectObject(hdcMem, hBitmap);
+
+    {
+        Graphics graphics(hdcMem);
+        graphics.SetSmoothingMode(SmoothingModeAntiAlias);
+        graphics.Clear(Color(0, 0, 0, 0));
+
+        Color dotColor;
+        switch (state) {
+            case EARNING_GOOD: dotColor = Color(255, 50, 255, 50); break; // Green
+            case SPENDING_ENTERTAINMENT: dotColor = Color(255, 255, 100, 50); break; // Orange
+            case SPENDING_NSFW: dotColor = Color(255, 255, 0, 255); break; // Deep Magenta/Fuschia
+            case AFK_PAUSED: dotColor = Color(255, 255, 255, 50); break; // Yellow
+            case NEUTRAL:
+            default: dotColor = Color(255, 100, 100, 100); break; // Gray
+        }
+
+        SolidBrush brush(dotColor);
+        graphics.FillEllipse(&brush, 2, 2, size - 4, size - 4);
+    }
+
+    POINT ptSrc = { 0, 0 };
+    SIZE winSize = { size, size };
+    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    
+    // Top Left Corner
+    POINT ptDst = { 10, 10 };
+    UpdateLayeredWindow(hDotWnd, hdcScreen, &ptDst, &winSize, hdcMem, &ptSrc, 0, &blend, ULW_ALPHA);
+
+    SelectObject(hdcMem, hOldBitmap);
+    DeleteObject(hBitmap);
+    DeleteDC(hdcMem);
+    ReleaseDC(NULL, hdcScreen);
+}
+
+void DrawNotifyWidget(HWND hWnd, const WCHAR* msg) {
+    if (!hWnd) return;
+    int width = 350; int height = 90;
+    HDC hdcScreen = GetDC(NULL);
+    HDC hdcMem = CreateCompatibleDC(hdcScreen);
+    HBITMAP hBitmap = CreateCompatibleBitmap(hdcScreen, width, height);
+    HBITMAP hOldBitmap = (HBITMAP)SelectObject(hdcMem, hBitmap);
+    {
+        Graphics graphics(hdcMem);
+        graphics.SetSmoothingMode(SmoothingModeAntiAlias);
+        graphics.Clear(Color(0,0,0,0));
+        
+        RectF panelRect(0, 0, (float)width, (float)height);
+        GraphicsPath panelPath;
+        AddRoundRect(&panelPath, panelRect, 10.0f);
+        SolidBrush bg(Color(250, 40, 10, 20));
+        graphics.FillPath(&bg, &panelPath);
+        
+        FontFamily defaultFamily(L"Segoe UI");
+        Gdiplus::Font fontTitle(g_fontFamilyTitle ? g_fontFamilyTitle : &defaultFamily, 16, FontStyleBold, UnitPixel);
+        Gdiplus::Font fontMsg(g_fontFamilyItem ? g_fontFamilyItem : &defaultFamily, 14, FontStyleRegular, UnitPixel);
+        
+        SolidBrush titleBrush(Color(255, 255, 200, 50));
+        SolidBrush txtBrush(Color(255, 255, 255, 255));
+        
+        graphics.DrawString(L"⚠ TOKENS DEPLETING", -1, &fontTitle, PointF(15.0f, 15.0f), &titleBrush);
+        graphics.DrawString(msg, -1, &fontMsg, PointF(15.0f, 45.0f), &txtBrush);
+    }
+    POINT ptSrc = {0,0}; SIZE sz = {width, height};
+    BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    UpdateLayeredWindow(hWnd, hdcScreen, NULL, &sz, hdcMem, &ptSrc, 0, &blend, ULW_ALPHA);
+    SelectObject(hdcMem, hOldBitmap); DeleteObject(hBitmap); DeleteDC(hdcMem); ReleaseDC(NULL, hdcScreen);
+}
+
+// -------------------------------------------------------------------------
+// Focus & Analytics Widget Window
+// -------------------------------------------------------------------------
+LRESULT CALLBACK FocusWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message == WM_NCHITTEST) {
+        LRESULT hit = DefWindowProc(hWnd, message, wParam, lParam);
+        if (hit == HTCLIENT) return HTCAPTION;
+        return hit;
+    }
+    return DefWindowProc(hWnd, message, wParam, lParam);
+}
+
+void DrawFocusWidget(HWND hWnd) {
+    int width = 400;
+    int height = 480; 
+
+    HDC hdcScreen = GetDC(NULL);
+    HDC hdcMem = CreateCompatibleDC(hdcScreen);
+    HBITMAP hBitmap = CreateCompatibleBitmap(hdcScreen, width, height);
+    HBITMAP hOldBitmap = (HBITMAP)SelectObject(hdcMem, hBitmap);
+
+    {
+        Graphics graphics(hdcMem);
+        graphics.SetSmoothingMode(SmoothingModeAntiAlias);
+        graphics.Clear(Color(0, 0, 0, 0));
+
+        RectF panelRect(0, 0, (float)width, (float)height);
+        GraphicsPath panelPath;
+        AddRoundRect(&panelPath, panelRect, 15.0f);
+        SolidBrush bgBrush(Color(220, 15, 20, 30)); // Deep dark blueish tint
+        graphics.FillPath(&bgBrush, &panelPath);
+
+        FontFamily defaultFamily(L"Segoe UI");
+        FontFamily* useTitleFamily = g_fontFamilyTitle ? g_fontFamilyTitle : &defaultFamily;
+        FontFamily* useItemFamily = g_fontFamilyItem ? g_fontFamilyItem : &defaultFamily;
+        Gdiplus::Font fontTitle(useTitleFamily, 16, FontStyleBold, UnitPixel);
+        Gdiplus::Font fontItem(useItemFamily, 13, FontStyleRegular, UnitPixel);
+        
+        SolidBrush accentBrush(Color(255, 100, 255, 200));
+        graphics.DrawString(L"FOCUS & ANALYTICS", -1, &fontTitle, PointF(20.0f, 15.0f), &accentBrush);
+
+        if (g_focusEngine) {
+            WCHAR buf[256];
+            float y = 50.0f;
+            float spacing = 45.0f;
+            float barWidth = 360.0f;
+            float x = 20.0f;
+
+            const WCHAR* stateStr = L"Neutral";
+            Color stateCol = Color(255, 100, 100, 100);
+            switch(g_focusEngine->currentState) {
+                case EARNING_GOOD: stateStr = L"Earning Tokens"; stateCol = Color(255, 50, 255, 50); break;
+                case SPENDING_ENTERTAINMENT: stateStr = L"Spending Tokens"; stateCol = Color(255, 255, 150, 50); break;
+                case SPENDING_NSFW: stateStr = L"NSFW Warning"; stateCol = Color(255, 255, 0, 255); break;
+                case AFK_PAUSED: stateStr = L"AFK Paused"; stateCol = Color(255, 255, 255, 50); break;
+                default: break;
+            }
+            
+            swprintf_s(buf, L"%s", stateStr);
+            DrawProgressBar(graphics, &fontItem, L"Engine State", buf, x, y, barWidth, 100.0f, stateCol, stateCol);
+            y += spacing;
+
+            int hr = g_focusEngine->earnedTokensSeconds / 3600;
+            int mn = (g_focusEngine->earnedTokensSeconds % 3600) / 60;
+            swprintf_s(buf, L"%02d h %02d m", hr, mn);
+            DrawProgressBar(graphics, &fontItem, L"Earned Tokens", buf, x, y, barWidth, 100.0f, Color(255, 50, 200, 255), Color(255, 50, 200, 255));
+            y += spacing;
+            
+            int nsfwHr = g_focusEngine->nsfwRemainingSeconds / 3600;
+            int nsfwMn = (g_focusEngine->nsfwRemainingSeconds % 3600) / 60;
+            swprintf_s(buf, L"%02d h %02d m", nsfwHr, nsfwMn);
+            DrawProgressBar(graphics, &fontItem, L"NSFW Allowance", buf, x, y, barWidth, 100.0f, Color(255, 200, 50, 100), Color(255, 200, 50, 100));
+            y += spacing + 10.0f;
+
+            graphics.DrawString(L"ACTIVE SCREEN TIME", -1, &fontTitle, PointF(20.0f, y), &accentBrush);
+            y += 30.0f;
+
+            int totalActive = max(1, g_focusEngine->totalActiveScreenTimeSeconds);
+            int totHr = totalActive / 3600;
+            int totMn = (totalActive % 3600) / 60;
+            swprintf_s(buf, L"%d:%02d hr", totHr, totMn);
+            
+            // Premium Platinum/Gold Thick Bar for Benchmarking
+            DrawProgressBar(graphics, &fontItem, L"Total Screen Time", buf, x, y, barWidth, 100.0f, Color(255, 255, 215, 0), Color(255, 255, 140, 0), 14.0f);
+            y += spacing;
+
+            // Tiny Subtle Divider Line
+            Pen dividerPen(Color(100, 255, 255, 255), 1.0f); 
+            graphics.DrawLine(&dividerPen, x + 30.0f, y, x + barWidth - 30.0f, y);
+            y += 15.0f; // Padding below the line before top apps render
+
+            auto topUsage = g_focusEngine->GetTopUsage(4);
+            
+            for (const auto& usage : topUsage) {
+                int sec = usage.second;
+                int uhr = sec / 3600;
+                int umn = (sec % 3600) / 60;
+                float pct = ((float)sec / (float)totalActive) * 100.0f;
+                swprintf_s(buf, L"%d:%02d hr", uhr, umn);
+                
+                std::wstring label = usage.first;
+                if (label.length() > 25) label = label.substr(0, 22) + L"...";
+
+                FocusState category = g_focusEngine->GetCategoryForName(usage.first);
+                Color startCol, endCol;
+                if (category == EARNING_GOOD) {
+                    startCol = Color(255, 50, 150, 255); endCol = Color(255, 50, 200, 255); // Cold (Blue)
+                } else if (category == SPENDING_ENTERTAINMENT) {
+                    startCol = Color(255, 255, 120, 50); endCol = Color(255, 255, 150, 50); // Warm (Orange)
+                } else if (category == SPENDING_NSFW) {
+                    startCol = Color(255, 255, 0, 150); endCol = Color(255, 255, 0, 255); // Danger (Magenta)
+                } else {
+                    startCol = Color(255, 150, 150, 150); endCol = Color(255, 100, 100, 100); // Neutral (Gray)
+                }
+
+                DrawProgressBar(graphics, &fontItem, label.c_str(), buf, x, y, barWidth, pct, startCol, endCol);
+                y += spacing;
+            }
+        }
+    }
+
+    POINT ptSrc = { 0, 0 };
+    SIZE size = { width, height };
+    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    UpdateLayeredWindow(hWnd, hdcScreen, NULL, &size, hdcMem, &ptSrc, 0, &blend, ULW_ALPHA);
+
+    SelectObject(hdcMem, hOldBitmap);
+    DeleteObject(hBitmap);
+    DeleteDC(hdcMem);
+    ReleaseDC(NULL, hdcScreen);
+}
+
+// -------------------------------------------------------------------------
 // DrawWidget: Renders the UI to an in-memory GDI+ Bitmap and pushes it 
 // directly to the screen via UpdateLayeredWindow natively. 
 // -------------------------------------------------------------------------
 void DrawWidget(HWND hWnd) {
-    int width = 400;
-    int height = 500; // Increased height to comfortably fit all graphical bars including temperatures
+    int width = 340;
+    int height = 430; // Original height for hardware stats
 
     HDC hdcScreen = GetDC(NULL);
     HDC hdcMem = CreateCompatibleDC(hdcScreen);
@@ -436,7 +657,7 @@ void DrawWidget(HWND hWnd) {
             WCHAR buf[256];
             float y = 50.0f;
             float spacing = 45.0f;
-            float barWidth = 360.0f;
+            float barWidth = 300.0f;
             float x = 20.0f;
 
             // CPU Bar (Orange/Red)
@@ -525,18 +746,18 @@ void DrawWidget(HWND hWnd) {
 // -------------------------------------------------------------------------
 void CALLBACK WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime) {
     if (event == EVENT_SYSTEM_FOREGROUND) {
-        if (!hwnd || hwnd == g_hWnd || !g_hWnd) return;
+        if (!hwnd) return;
 
         WCHAR className[256];
         if (GetClassNameW(hwnd, className, 256)) {
-            // If the user clicks "Show Desktop" (Win+D) or the desktop background, 
-            // the OS will sweep and blindly hide all overlaid windows.
             if (wcscmp(className, L"Progman") == 0 || wcscmp(className, L"WorkerW") == 0) {
-                // Instantly vault the widget to TOPMOST so the DWM ignores it
-                SetWindowPos(g_hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                if (g_hWnd) SetWindowPos(g_hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                if (g_hFocusWidgetWnd) SetWindowPos(g_hFocusWidgetWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             } else {
-                // Focus shifted to a normal application, safely drop down
-                SetWindowPos(g_hWnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                if (hwnd == g_hWnd || hwnd == g_hFocusWidgetWnd || hwnd == g_hDotWnd) return;
+                
+                if (g_hWnd) SetWindowPos(g_hWnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                if (g_hFocusWidgetWnd) SetWindowPos(g_hFocusWidgetWnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             }
         }
     }
@@ -551,6 +772,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             // Initialize Hardware Monitor
             g_hwMonitor = new HardwareMonitor();
             g_wmiMonitor = new WmiTemperatureMonitor();
+            g_focusEngine = new FocusEngine();
             // 1) 1000ms strictly event-driven Timer - keeps CPU at 0%
             SetTimer(hWnd, 1, 1000, NULL);
             // 2) Initial Draw
@@ -559,7 +781,35 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
         case WM_TIMER:
             if (wParam == 1) {
+                if (g_focusEngine) {
+                    g_focusEngine->ProcessTick();
+                    
+                    if (g_focusEngine->warningActive) {
+                        g_focusEngine->warningActive = false;
+                        g_notifyFrames = 7; // Display notification for 7 seconds
+                        if (!g_hNotifyWnd) {
+                            int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+                            int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+                            // Slide in slightly above the taskbar on the right side
+                            g_hNotifyWnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                                L"DotIndicatorClass", L"Notify", WS_POPUP, screenWidth - 350 - 20, screenHeight - 150, 350, 90, NULL, NULL, GetModuleHandle(NULL), NULL);
+                            ShowWindow(g_hNotifyWnd, SW_SHOWNA);
+                        }
+                        DrawNotifyWidget(g_hNotifyWnd, g_focusEngine->warningMsg.c_str());
+                    }
+                }
+                
+                if (g_notifyFrames > 0) {
+                    g_notifyFrames--;
+                    if (g_notifyFrames == 0 && g_hNotifyWnd) {
+                        DestroyWindow(g_hNotifyWnd);
+                        g_hNotifyWnd = NULL;
+                    }
+                }
+
+                if (g_hDotWnd && g_focusEngine) DrawDotIndicator(g_hDotWnd, g_focusEngine->currentState);
                 DrawWidget(hWnd);
+                if (g_hFocusWidgetWnd) DrawFocusWidget(g_hFocusWidgetWnd);
             }
             break;
 
@@ -588,6 +838,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             if (g_wmiMonitor) {
                 delete g_wmiMonitor;
                 g_wmiMonitor = nullptr;
+            }
+            if (g_focusEngine) {
+                delete g_focusEngine;
+                g_focusEngine = nullptr;
             }
             PostQuitMessage(0);
             break;
@@ -625,17 +879,38 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
 
+    // Register Dot Indicator Window Class
+    const wchar_t DOT_CLASS_NAME[] = L"DotIndicatorClass";
+    WNDCLASSW dwc = { 0 };
+    dwc.lpfnWndProc = DotWndProc;
+    dwc.hInstance = hInstance;
+    dwc.lpszClassName = DOT_CLASS_NAME;
+    RegisterClassW(&dwc);
+
+    // Register Focus Widget Window Class
+    const wchar_t FOCUS_CLASS_NAME[] = L"FocusWidgetClass";
+    WNDCLASSW fwc = { 0 };
+    fwc.lpfnWndProc = FocusWndProc;
+    fwc.hInstance = hInstance;
+    fwc.lpszClassName = FOCUS_CLASS_NAME;
+    fwc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    RegisterClassW(&fwc);
+
     // 3) Create floating, unowned window (Parent = NULL)
     // WS_EX_LAYERED: Required for UpdateLayeredWindow
     // WS_EX_TOOLWINDOW: Hides from Alt-Tab
     // WS_EX_NOACTIVATE: Prevents stealing focus
     // WS_POPUP: Barebones popup window with no border
+    
+    int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+    int hwX = screenWidth - 340 - 20;
+
     g_hWnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         CLASS_NAME,
         L"Desktop Widget",
         WS_POPUP,
-        100, 100, 400, 500,   // Initial size/location
+        hwX, 20, 340, 430,   // Hardware widget parked top right
         NULL,                 // *Very* important: Unowned (No parent)
         NULL,                 // No menu
         hInstance,
@@ -648,6 +923,25 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         return 0;
     }
 
+    g_hDotWnd = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+        DOT_CLASS_NAME,
+        L"Dot",
+        WS_POPUP,
+        0, 0, 32, 32,
+        NULL, NULL, hInstance, NULL
+    );
+
+    int focusX = screenWidth - 400 - 20;
+    g_hFocusWidgetWnd = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        FOCUS_CLASS_NAME,
+        L"Focus Analytics",
+        WS_POPUP,
+        focusX, 470, 400, 480,   // Window height extended slightly for subtle divider separator element
+        NULL, NULL, hInstance, NULL
+    );
+
     // 4) Register the EVENT_SYSTEM_FOREGROUND WinEventHook
     g_hEventHook = SetWinEventHook(
         EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
@@ -658,6 +952,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 
     // 5) Show but do NOT steal focus (SW_SHOWNA)
     ShowWindow(g_hWnd, SW_SHOWNA);
+    if (g_hFocusWidgetWnd) ShowWindow(g_hFocusWidgetWnd, SW_SHOWNA);
+    if (g_hDotWnd) ShowWindow(g_hDotWnd, SW_SHOWNA);
 
     // 6) Sleep-friendly Event Loop (0% CPU overhead)
     MSG msg;
@@ -675,6 +971,10 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     if (g_wmiMonitor) {
         delete g_wmiMonitor;
         g_wmiMonitor = nullptr;
+    }
+    if (g_focusEngine) {
+        delete g_focusEngine;
+        g_focusEngine = nullptr;
     }
     
     CleanupFonts();
