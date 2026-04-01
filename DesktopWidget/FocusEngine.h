@@ -8,6 +8,7 @@
 #include <psapi.h>
 #include <algorithm>
 #include <unordered_map>
+#include <map>
 #include <deque>
 #include <ctime>
 #include <chrono>
@@ -35,7 +36,7 @@ public:
     int nsfwRemainingSeconds = 7200;   // 2 hours limit (7200 seconds)
     
     int afkTimeoutMs = 120000;         // 120s of no keyboard/mouse -> AFK
-    int activityRequiredForWakeMs = 60000; // Must be active for 60s to start earning again
+    int activityRequiredForWakeMs = 3000; // Must be active for 3s to break Deep AFK
 
     FocusState currentState = NEUTRAL;
     DWORD lastActiveTick = 0;
@@ -96,6 +97,8 @@ public:
         }
         return L"";
     }
+
+    std::map<HWND, std::wstring> browserUrlCache;
 
     FocusEngine(const std::wstring& path) {
         saveFilePath = path;
@@ -254,6 +257,39 @@ public:
         totalActiveScreenTimeSeconds = inTotal;
         lastNsfwRefreshTime = inEpoch;
         usageTracker = std::move(tempMap);
+        
+        // Prevent mid-day restart data wipes natively by binding lastKnownDate to file write time seamlessly
+        WIN32_FILE_ATTRIBUTE_DATA fileInfo;
+        if (GetFileAttributesExW(saveFilePath.c_str(), GetFileExInfoStandard, &fileInfo)) {
+            SYSTEMTIME st;
+            FileTimeToSystemTime(&fileInfo.ftLastWriteTime, &st);
+            wchar_t dateBuf[256];
+            swprintf(dateBuf, 256, L"%04d-%02d-%02d", st.wYear, st.wMonth, st.wDay);
+            lastKnownDate = dateBuf;
+        } else {
+            lastKnownDate = GetDateString(); // Fallback
+        }
+
+        // -------------------------------------------------------------
+        // WATCHDOG ANTI-CHEAT TOKEN BURN VERIFICATION
+        // -------------------------------------------------------------
+        HKEY hKey;
+        DWORD burn = 0;
+        DWORD size = sizeof(DWORD);
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\DeepWorkDesktop", 0, KEY_READ | KEY_WRITE, &hKey) == ERROR_SUCCESS) {
+            if (RegQueryValueExW(hKey, L"BurnTokens", NULL, NULL, (LPBYTE)&burn, &size) == ERROR_SUCCESS) {
+                if (burn == 1) {
+                    earnedTokensSeconds = 0; // Obliterate saved tokens inherently natively
+                    // Persist the punishment cleanly resetting the hook
+                    DWORD reset = 0;
+                    RegSetValueExW(hKey, L"BurnTokens", 0, REG_DWORD, (const BYTE*)&reset, sizeof(DWORD));
+                    
+                    // Show aggressive Penalty Warning natively exactly upon resurrection
+                    MessageBoxW(NULL, L"You tried to cheat. You broke the law.\n\nYou have to pay the forfeit: 100% of your earned Tokens have been permanently annihilated as punishment.", L"ANTI-CHEAT PENALTY ENGAGED", MB_ICONERROR | MB_SYSTEMMODAL | MB_TOPMOST);
+                }
+            }
+            RegCloseKey(hKey);
+        }
     }
 
     std::wstring GetActiveExeName(HWND hForeground) {
@@ -359,11 +395,23 @@ public:
         // MIDNIGHT DATABASE ROLLOVER / SHARDING
         // -------------------------------------------------------------
         std::wstring todayStr = GetDateString();
-        if (todayStr != lastKnownDate) {
+        if (todayStr != lastKnownDate && !lastKnownDate.empty()) {
             totalActiveScreenTimeSeconds = 0;
             usageTracker.clear();
             lastKnownDate = todayStr;
             SaveState(); // Instantly serialize and construct the new blank physical Shard natively
+        } else if (lastKnownDate.empty()) {
+            lastKnownDate = todayStr;
+        }
+        
+        // -------------------------------------------------------------
+        // BI-WEEKLY (14-DAY) NSFW BUDGET REFRESH MECHANIC
+        // -------------------------------------------------------------
+        time_t now = time(NULL);
+        if (now - lastNsfwRefreshTime >= (14 * 24 * 3600)) {
+            nsfwRemainingSeconds = 7200; // Reset strict 2-hour budget natively
+            lastNsfwRefreshTime = now;
+            SaveState();
         }
 
         // -------------------------------------------------------------
@@ -390,8 +438,17 @@ public:
 
             if (exeName == L"chrome.exe" || exeName == L"msedge.exe" || exeName == L"firefox.exe" || exeName == L"brave.exe") {
                 std::wstring url = ExtractUrlFromBrowser(hForeground);
-                if (!url.empty()) trackingName = url;
-                else trackingName = titleStr; // UIA Fallback
+                if (!url.empty()) {
+                    trackingName = url;
+                    browserUrlCache[hForeground] = url; // Cache the URL while Address Bar is visible
+                } else {
+                    // Fullscreen UIAutomation Bypass: Retrieve the last known URL for this exact browser window
+                    if (browserUrlCache.find(hForeground) != browserUrlCache.end()) {
+                        trackingName = browserUrlCache[hForeground];
+                    } else {
+                        trackingName = titleStr; // Absolute fallback
+                    }
+                }
                 
                 // Privacy scrub logic (extract exact category strings unconditionally)
                 auto MatchesTitle = [](const std::wstring& s, const std::wstring& t) {
@@ -471,22 +528,6 @@ public:
             DWORD currentTick = GetTickCount();
             DWORD idleTime = currentTick - lii.dwTime;
 
-            // Bounding Box Anti-Cheat Check
-            bool jigglerDetected = false;
-            if (mouseHistory.size() >= 60) {
-                long minX = mouseHistory[0].x, maxX = mouseHistory[0].x;
-                long minY = mouseHistory[0].y, maxY = mouseHistory[0].y;
-                for (const auto& p : mouseHistory) {
-                    if (p.x < minX) minX = p.x;
-                    if (p.x > maxX) maxX = p.x;
-                    if (p.y < minY) minY = p.y;
-                    if (p.y > maxY) maxY = p.y;
-                }
-                if ((maxX - minX) <= 30 && (maxY - minY) <= 30) {
-                    jigglerDetected = true;
-                }
-            }
-
             DWORD afkThreshold = 90000;
             if (currentState == SPENDING_ENTERTAINMENT || currentState == SPENDING_NSFW) {
                 afkThreshold = 3600000; // 1 Hour (Media)
@@ -494,7 +535,7 @@ public:
                 afkThreshold = 1800000; // 30 Minutes
             }
 
-            if (idleTime > afkThreshold || jigglerDetected) {
+            if (idleTime > afkThreshold) {
                 forceAfk = true;
             } else {
                 if (isAfk) {

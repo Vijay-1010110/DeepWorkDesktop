@@ -27,6 +27,10 @@
 #include <Wbemidl.h>
 #pragma comment(lib, "wbemuuid.lib")
 
+#include <shellapi.h>
+#include <shlobj.h>
+#include <shobjidl.h>
+
 #include "FocusEngine.h"
 
 using namespace Gdiplus;
@@ -38,6 +42,7 @@ HWND g_hWnd = NULL;
 HWND g_hDotWnd = NULL;
 HWND g_hFocusWidgetWnd = NULL;
 HWND g_hNotifyWnd = NULL;
+HWND g_hOwnerWnd = NULL; // Hidden owner window for Task View persistence
 int g_notifyFrames = 0;
 ULONG_PTR g_gdiplusToken;
 HWINEVENTHOOK g_hEventHook = NULL;
@@ -1004,8 +1009,35 @@ void DrawWidget(HWND hWnd) {
 }
 
 // -------------------------------------------------------------------------
-// WinEventHook Callback: Evading Windows 11 24H2 DWM Bug
-// "The Rainmeter Instantaneous Z-Order Juggle"
+// Z-Order Targeting: Find the precise slice above the Desktop Wallpaper
+// -------------------------------------------------------------------------
+HWND GetZOrderTargetAboveDesktop() {
+    HWND hProgman = FindWindowW(L"Progman", L"Program Manager");
+    HWND hDefView = FindWindowExW(hProgman, NULL, L"SHELLDLL_DefView", NULL);
+    HWND hDesktopHost = hProgman;
+
+    if (!hDefView) {
+        // Try Windows 11 / Windows 10 WorkerW alternative
+        HWND hWorkerW = NULL;
+        do {
+            hWorkerW = FindWindowExW(NULL, hWorkerW, L"WorkerW", NULL);
+            if (hWorkerW) {
+                if (FindWindowExW(hWorkerW, NULL, L"SHELLDLL_DefView", NULL)) {
+                    hDesktopHost = hWorkerW;
+                    break;
+                }
+            }
+        } while (hWorkerW);
+    }
+    
+    // Get the window directly above the identified desktop host
+    HWND hwndTarget = GetWindow(hDesktopHost, GW_HWNDPREV);
+    // If for some reason there is no window above it, default to BOTTOM
+    return hwndTarget ? hwndTarget : HWND_BOTTOM;
+}
+
+// -------------------------------------------------------------------------
+// WinEventHook Callback: Tracking Desktop Focus
 // -------------------------------------------------------------------------
 void CALLBACK WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime) {
     if (event == EVENT_SYSTEM_FOREGROUND) {
@@ -1014,20 +1046,37 @@ void CALLBACK WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, 
         WCHAR className[256];
         if (GetClassNameW(hwnd, className, 256)) {
             if (wcscmp(className, L"Progman") == 0 || wcscmp(className, L"WorkerW") == 0) {
-                if (g_hWnd) SetWindowPos(g_hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                if (g_hFocusWidgetWnd) SetWindowPos(g_hFocusWidgetWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                if (g_hWnd) {
+                    ShowWindow(g_hWnd, SW_SHOWNA);
+                    SetWindowPos(g_hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
+                if (g_hFocusWidgetWnd) {
+                    ShowWindow(g_hFocusWidgetWnd, SW_SHOWNA);
+                    SetWindowPos(g_hFocusWidgetWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
             } else if (wcscmp(className, L"#32768") == 0 || 
                        wcscmp(className, L"tooltips_class32") == 0 || 
                        wcscmp(className, L"SysListView32") == 0 ||
-                       wcscmp(className, L"XamlExplorerHostIslandWindow") == 0) {
+                       wcscmp(className, L"XamlExplorerHostIslandWindow") == 0 ||
+                       wcscmp(className, L"PopupHost") == 0 ||
+                       wcscmp(className, L"Xaml_WindowedPopupClass") == 0 ||
+                       wcscmp(className, L"Windows.UI.Core.CoreWindow") == 0) {
                 // Ignore Context Menus, Windows 11 Popups, Tooltips, and internal icon lists natively
                 return;
             } else {
-                if (hwnd == g_hWnd || hwnd == g_hFocusWidgetWnd || hwnd == g_hDotWnd || hwnd == g_hNotifyWnd) return;
+                if (hwnd == g_hWnd || hwnd == g_hFocusWidgetWnd || hwnd == g_hDotWnd || hwnd == g_hNotifyWnd || hwnd == g_hOwnerWnd || hwnd == g_hDashboardWnd) return;
                 
-                // Strip TOPMOST status without forcefully banishing the layer below the WorkerW Desktop Wallpaper natively
-                if (g_hWnd) SetWindowPos(g_hWnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                if (g_hFocusWidgetWnd) SetWindowPos(g_hFocusWidgetWnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                // Assert precisely above the Desktop Wallpaper natively without sinking behind WorkerW
+                HWND hInsertTarget = GetZOrderTargetAboveDesktop();
+                
+                if (g_hWnd) {
+                    ShowWindow(g_hWnd, SW_SHOWNA);
+                    SetWindowPos(g_hWnd, hInsertTarget, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
+                if (g_hFocusWidgetWnd) {
+                    ShowWindow(g_hFocusWidgetWnd, SW_SHOWNA);
+                    SetWindowPos(g_hFocusWidgetWnd, hInsertTarget, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
             }
         }
     }
@@ -1095,8 +1144,26 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             return hit;
         }
 
-        case WM_DESTROY:
+        case WM_ENDSESSION: {
+            if (wParam) { // The system is officially structurally shutting down natively!
+                HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, L"DeepWorkShutdownEvent");
+                if (hEvent) {
+                    SetEvent(hEvent);
+                    CloseHandle(hEvent); // Broadcast authentic OS shutdown to safely disable Watchdog Anti-Cheat cleanly
+                }
+            }
+            return 0;
+        }
+        
+        case WM_DESTROY: {
             KillTimer(hWnd, 1);
+            
+            // Clean unregister from Windows Shell
+            APPBARDATA abd = { sizeof(APPBARDATA) };
+            if (g_hWnd) { abd.hWnd = g_hWnd; SHAppBarMessage(ABM_REMOVE, &abd); }
+            if (g_hFocusWidgetWnd) { abd.hWnd = g_hFocusWidgetWnd; SHAppBarMessage(ABM_REMOVE, &abd); }
+            if (g_hDotWnd) { abd.hWnd = g_hDotWnd; SHAppBarMessage(ABM_REMOVE, &abd); }
+            
             if (g_hwMonitor) {
                 delete g_hwMonitor;
                 g_hwMonitor = nullptr;
@@ -1111,6 +1178,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             }
             PostQuitMessage(0);
             break;
+        }
 
         default:
             return DefWindowProc(hWnd, message, wParam, lParam);
@@ -1137,6 +1205,239 @@ void EnableAutoStart() {
 }
 
 // -------------------------------------------------------------------------
+// Native C++ Setup Wizard & Self-Installer Logic
+// -------------------------------------------------------------------------
+void RunWatchdogMode(DWORD hostPid) {
+    HANDLE hHost = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_INFORMATION, FALSE, hostPid);
+    if (!hHost) ExitProcess(0);
+
+    HANDLE hShutdownEvent = CreateEventW(NULL, TRUE, FALSE, L"DeepWorkShutdownEvent");
+    HANDLE waitArray[2] = { hHost, hShutdownEvent };
+
+    // Continuously monitor the host process simultaneously alongside authentic System Shutdown broadcasts asynchronously natively
+    DWORD waitResult = WaitForMultipleObjects(2, waitArray, FALSE, INFINITE);
+
+    if (waitResult == WAIT_OBJECT_0 + 1) { // hShutdownEvent triggered structurally
+        // Legitimate OS Shutdown detected natively. Conclude Watchdog successfully without penalty.
+        ExitProcess(0);
+    } else if (waitResult == WAIT_OBJECT_0) { // hHost explicitly terminated
+        // -----------------------------------------------------------------
+        // ILLEGAL ASSASSINATION DETECTED! Deploy Token Burn Penalty Protocol
+        // -----------------------------------------------------------------
+        HKEY hKey;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\DeepWorkDesktop", 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+            DWORD burn = 1;
+            RegSetValueExW(hKey, L"BurnTokens", 0, REG_DWORD, (const BYTE*)&burn, sizeof(DWORD));
+            RegCloseKey(hKey);
+        }
+
+        // Instantly Resurrect the Main Architecture structurally natively
+        wchar_t exePath[MAX_PATH];
+        GetModuleFileNameW(NULL, exePath, MAX_PATH);
+
+        STARTUPINFOW si = { sizeof(si) };
+        PROCESS_INFORMATION pi;
+        if (CreateProcessW(exePath, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        }
+        ExitProcess(0); // Terminate current instance, allowing the newly revived Host to subsequently spin up a pristine Watchdog cleanly
+    }
+    ExitProcess(0);
+}
+
+bool g_InstallAccepted = false;
+bool g_CustomPath = false;
+
+std::wstring g_LicenseText = L"DEEP WORK DESKTOP END USER LICENSE AGREEMENT\r\n\r\n"
+"1. TERMS OF AGREEMENT\r\n"
+"By installing this application, you agree to formally dedicate your screen time to high-productivity and deep focus workflows.\r\n\r\n"
+"2. ANTI-CHEAT & PENALTIES\r\n"
+"This software actively utilizes an aggressive Dual-Process Hydra Watchdog natively. Attempting to illegally terminate this instance via Task Manager mathematically constitutes cheating. The Watchdog will seamlessly resurrect the tracker automatically and physically eradicate 100% of your saved tokens as an unappealable forfeiture penalty instantly.\r\n\r\n"
+"3. PRIVACY\r\n"
+"100% of active window metrics, analytics, and tokens strictly remain structurally isolated locally to you natively. Zero physical data intrinsically transverses the internet inherently natively.\r\n\r\n"
+"4. LICENSE\r\n"
+"This custom mathematical application is provided beneath the open-source MIT License strictly 'as is' without warranty naturally.";
+
+LRESULT CALLBACK SetupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    static HWND hCheck, hInstall, hCustom, hCancel, hEdit, hStatic;
+    switch (msg) {
+        case WM_CREATE: {
+            HFONT hFont = CreateFontW(-14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+            HFONT hBold = CreateFontW(-18, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+
+            hStatic = CreateWindowExW(0, L"STATIC", L"Deep Work Desktop Installation", WS_CHILD | WS_VISIBLE, 20, 20, 400, 25, hwnd, NULL, NULL, NULL);
+            hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", g_LicenseText.c_str(), WS_CHILD | WS_VISIBLE | ES_MULTILINE | WS_VSCROLL | ES_READONLY, 20, 55, 440, 195, hwnd, NULL, NULL, NULL);
+            hCheck = CreateWindowExW(0, L"BUTTON", L" I accept the terms in the License Agreement", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 20, 260, 400, 20, hwnd, (HMENU)1, NULL, NULL);
+            
+            hCustom = CreateWindowExW(0, L"BUTTON", L"Custom Path...", WS_CHILD | WS_VISIBLE, 140, 310, 110, 30, hwnd, (HMENU)3, NULL, NULL);
+            hInstall = CreateWindowExW(0, L"BUTTON", L"Install", WS_CHILD | WS_VISIBLE | WS_DISABLED, 260, 310, 100, 30, hwnd, (HMENU)2, NULL, NULL);
+            hCancel = CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE, 370, 310, 90, 30, hwnd, (HMENU)4, NULL, NULL);
+
+            SendMessage(hStatic, WM_SETFONT, (WPARAM)hBold, TRUE);
+            SendMessage(hEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
+            SendMessage(hCheck, WM_SETFONT, (WPARAM)hFont, TRUE);
+            SendMessage(hInstall, WM_SETFONT, (WPARAM)hFont, TRUE);
+            SendMessage(hCustom, WM_SETFONT, (WPARAM)hFont, TRUE);
+            SendMessage(hCancel, WM_SETFONT, (WPARAM)hFont, TRUE);
+            break;
+        }
+        case WM_COMMAND: {
+            if (LOWORD(wParam) == 1) { // Checkbox
+                bool checked = (SendMessage(hCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                EnableWindow(hInstall, checked);
+            } else if (LOWORD(wParam) == 2) { // Install
+                g_InstallAccepted = true;
+                DestroyWindow(hwnd);
+            } else if (LOWORD(wParam) == 3) { // Custom Path
+                g_InstallAccepted = true;
+                g_CustomPath = true;
+                DestroyWindow(hwnd);
+            } else if (LOWORD(wParam) == 4) { // Cancel
+                DestroyWindow(hwnd);
+            }
+            break;
+        }
+        case WM_DESTROY: {
+            PostQuitMessage(0);
+            break;
+        }
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+bool RunNativeInstaller(HINSTANCE hInstance) {
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+
+    // 1) Verify Registry to definitively determine if we are currently running physically installed
+    HKEY hKey;
+    wchar_t regPath[MAX_PATH] = { 0 };
+    DWORD pathSize = MAX_PATH * sizeof(wchar_t);
+    bool isInstalled = false;
+    
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\DeepWorkDesktop", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        if (RegQueryValueExW(hKey, L"InstallPath", NULL, NULL, (LPBYTE)regPath, &pathSize) == ERROR_SUCCESS) {
+            if (_wcsicmp(exePath, regPath) == 0) isInstalled = true;
+        }
+        RegCloseKey(hKey);
+    }
+    
+    if (isInstalled) return false; // Hand-off dynamically to wWinMain
+
+    // 2) Run Native Setup GUI Wizard directly via local message loop natively
+    WNDCLASSW wc = {0};
+    wc.lpfnWndProc = SetupWndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = L"DeepWorkSetupClass";
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    RegisterClassW(&wc);
+
+    int cx = GetSystemMetrics(SM_CXSCREEN);
+    int cy = GetSystemMetrics(SM_CYSCREEN);
+    HWND hSetup = CreateWindowExW(WS_EX_APPWINDOW, L"DeepWorkSetupClass", L"Deep Work Desktop Setup", 
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, 
+        (cx - 500) / 2, (cy - 400) / 2, 500, 400, 
+        NULL, NULL, hInstance, NULL);
+
+    ShowWindow(hSetup, SW_SHOW);
+    UpdateWindow(hSetup);
+
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    
+    if (!g_InstallAccepted) ExitProcess(0);
+
+    CoInitialize(NULL);
+    std::wstring installDir = L"";
+
+    if (g_CustomPath) {
+        // Render Native Windows 11 Folder Picker natively
+        IFileOpenDialog* pfd;
+        if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pfd)))) {
+            DWORD dwOptions;
+            if (SUCCEEDED(pfd->GetOptions(&dwOptions))) pfd->SetOptions(dwOptions | FOS_PICKFOLDERS); // Restrict exclusively to directories
+            
+            if (SUCCEEDED(pfd->Show(NULL))) {
+                IShellItem* psi;
+                if (SUCCEEDED(pfd->GetResult(&psi))) {
+                    LPWSTR pszName;
+                    if (SUCCEEDED(psi->GetDisplayName(SIGDN_FILESYSPATH, &pszName))) {
+                        installDir = pszName;
+                        installDir += L"\\DeepWorkDesktop";
+                        CoTaskMemFree(pszName);
+                    }
+                    psi->Release();
+                }
+            }
+            pfd->Release();
+        }
+        if (installDir.empty()) {
+            MessageBoxW(NULL, L"No folder selected. Installation cancelled.", L"Setup Cancelled", MB_ICONWARNING);
+            CoUninitialize();
+            ExitProcess(0);
+        }
+    } else {
+        // Render Default AppData physical path dynamically
+        wchar_t appData[MAX_PATH];
+        if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, appData))) {
+            installDir = std::wstring(appData) + L"\\DeepWorkDesktop";
+        }
+    }
+
+    // 3) Construction & Physical Payload Extraction
+    std::wstring targetExe = installDir + L"\\DeepWorkDesktop.exe";
+    CreateDirectoryW(installDir.c_str(), NULL);
+
+    if (!CopyFileW(exePath, targetExe.c_str(), FALSE)) {
+        MessageBoxW(NULL, L"Installation failed. Could not copy DeepWorkDesktop.exe. Check physical write permissions.", L"Setup Error", MB_ICONERROR);
+        CoUninitialize();
+        return false;
+    }
+
+    // 4) Set Persistent Registry Flag exclusively validating future launches conditionally natively
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\DeepWorkDesktop", 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        RegSetValueExW(hKey, L"InstallPath", 0, REG_SZ, (const BYTE*)targetExe.c_str(), (DWORD)((targetExe.length() + 1) * sizeof(wchar_t)));
+        RegCloseKey(hKey);
+    }
+
+    // 4.5) Enable Native Auto-Start on Windows Boot sequence organically
+    HKEY hRunKey;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hRunKey, NULL) == ERROR_SUCCESS) {
+        RegSetValueExW(hRunKey, L"DeepWorkDesktop", 0, REG_SZ, (const BYTE*)targetExe.c_str(), (DWORD)((targetExe.length() + 1) * sizeof(wchar_t)));
+        RegCloseKey(hRunKey);
+    }
+
+    // 5) Build Universal Start Menu Shortcut structurally
+    wchar_t programsFolder[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_PROGRAMS, NULL, 0, programsFolder))) {
+        std::wstring linkPath = std::wstring(programsFolder) + L"\\Deep Work Desktop.lnk";
+        IShellLinkW* psl;
+        if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_IShellLinkW, (LPVOID*)&psl))) {
+            psl->SetPath(targetExe.c_str());
+            psl->SetDescription(L"Launch Deep Work Desktop");
+            psl->SetWorkingDirectory(installDir.c_str());
+            IPersistFile* ppf;
+            if (SUCCEEDED(psl->QueryInterface(IID_IPersistFile, (LPVOID*)&ppf))) {
+                ppf->Save(linkPath.c_str(), TRUE);
+                ppf->Release();
+            }
+            psl->Release();
+        }
+    }
+    CoUninitialize();
+
+    // 6) Auto-boot seamlessly to conclude Installer routing
+    ShellExecuteW(NULL, L"open", targetExe.c_str(), NULL, installDir.c_str(), SW_SHOWDEFAULT);
+    ExitProcess(0);
+    return true;
+}
+
+// -------------------------------------------------------------------------
 // Application Entry Point: wWinMain
 // -------------------------------------------------------------------------
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
@@ -1145,7 +1446,18 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
                      _In_ int       nCmdShow)
 {
     UNREFERENCED_PARAMETER(hPrevInstance);
-    UNREFERENCED_PARAMETER(lpCmdLine);
+
+    // [HYDRA WATCHDOG GUARD] Structurally hijack execution synchronously if initiated explicitly as a background defense node
+    std::wstring cmd = lpCmdLine;
+    if (cmd.find(L"--watchdog") != std::wstring::npos) {
+        size_t pos = cmd.find(L"--watchdog");
+        DWORD hostPid = std::stoul(cmd.substr(pos + 11));
+        RunWatchdogMode(hostPid);
+        return 0; 
+    }
+
+    // [INSTALLER GUARD] Intercept execution if running natively from outside strictly defined persistent AppData bounds
+    if (RunNativeInstaller(hInstance)) return 0;
 
     // 1) Initialize GDI+
     GdiplusStartupInput gdiplusStartupInput;
@@ -1192,25 +1504,26 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     dashc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassW(&dashc);
 
-    // 3) Create floating, unowned window (Parent = NULL)
-    // WS_EX_LAYERED: Required for UpdateLayeredWindow
-    // WS_EX_TOOLWINDOW: Hides from Alt-Tab
-    // WS_EX_NOACTIVATE: Prevents stealing focus
-    // WS_POPUP: Barebones popup window with no border
-    
+    // 3) Create Hidden Owner Window for Task View Visibility
+    // Windows hides 'owned' windows from Alt+Tab, but perfectly renders them in Task View without requiring WS_EX_TOOLWINDOW!
+    g_hOwnerWnd = CreateWindowExW(
+        0, CLASS_NAME, L"HiddenOwner",
+        WS_POPUP, 0, 0, 0, 0,
+        NULL, NULL, hInstance, NULL
+    );
+
+    // 4) Create Widget Windows mathematically linked to the Owner natively
     int screenWidth = GetSystemMetrics(SM_CXSCREEN);
     int hwX = screenWidth - 340 - 20;
 
     g_hWnd = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        WS_EX_LAYERED | WS_EX_NOACTIVATE, // NO WS_EX_TOOLWINDOW
         CLASS_NAME,
         L"Desktop Widget",
         WS_POPUP,
-        hwX, 20, 340, 430,   // Hardware widget parked top right
-        NULL,                 // *Very* important: Unowned (No parent)
-        NULL,                 // No menu
-        hInstance,
-        NULL
+        hwX, 20, 340, 430,
+        g_hOwnerWnd, // Owned explicitly to suppress Alt+Tab intelligently
+        NULL, hInstance, NULL
     );
 
     if (g_hWnd == NULL) {
@@ -1220,22 +1533,22 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     }
 
     g_hDotWnd = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE, // Isolated Topmost sovereignty
         DOT_CLASS_NAME,
         L"Dot",
         WS_POPUP,
         0, 0, 32, 32,
-        NULL, NULL, hInstance, NULL
+        NULL, NULL, hInstance, NULL // Detached from Owner to prevent z-order sinking
     );
 
     int focusX = screenWidth - 400 - 20;
     g_hFocusWidgetWnd = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        WS_EX_LAYERED | WS_EX_NOACTIVATE, // NO WS_EX_TOOLWINDOW
         FOCUS_CLASS_NAME,
         L"Focus Analytics",
         WS_POPUP,
-        focusX, 470, 400, 480,   // Window height extended slightly for subtle divider separator element
-        NULL, NULL, hInstance, NULL
+        focusX, 470, 400, 480,
+        g_hOwnerWnd, NULL, hInstance, NULL
     );
 
     // Instantiate hidden Dashboard Telemetry window natively properly centered
@@ -1249,7 +1562,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         NULL, NULL, hInstance, NULL
     );
 
-    // 4) Register the EVENT_SYSTEM_FOREGROUND WinEventHook
+    // 5) Register the EVENT_SYSTEM_FOREGROUND WinEventHook
     g_hEventHook = SetWinEventHook(
         EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
         NULL, WinEventProc,
@@ -1257,10 +1570,39 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
     );
 
-    // 5) Show but do NOT steal focus (SW_SHOWNA)
+    // 6) Engage Win+D AppBar Exclusions globally
+    APPBARDATA abd = { sizeof(APPBARDATA) };
+    if (g_hWnd) { abd.hWnd = g_hWnd; SHAppBarMessage(ABM_NEW, &abd); }
+    if (g_hFocusWidgetWnd) { abd.hWnd = g_hFocusWidgetWnd; SHAppBarMessage(ABM_NEW, &abd); }
+    if (g_hDotWnd) { abd.hWnd = g_hDotWnd; SHAppBarMessage(ABM_NEW, &abd); }
+
+    // 7) Show but do NOT steal focus (SW_SHOWNA)
     ShowWindow(g_hWnd, SW_SHOWNA);
     if (g_hFocusWidgetWnd) ShowWindow(g_hFocusWidgetWnd, SW_SHOWNA);
     if (g_hDotWnd) ShowWindow(g_hDotWnd, SW_SHOWNA);
+
+    // -------------------------------------------------------------------------
+    // HYDRA DEPLOYMENT: Generate Mutual Watchdog Thread natively
+    // -------------------------------------------------------------------------
+    CreateThread(NULL, 0, [](LPVOID) -> DWORD {
+        while (true) {
+            wchar_t exePath[MAX_PATH];
+            GetModuleFileNameW(NULL, exePath, MAX_PATH);
+            
+            std::wstring args = std::wstring(exePath) + L" --watchdog " + std::to_wstring(GetCurrentProcessId());
+            
+            STARTUPINFOW si = { sizeof(si) };
+            PROCESS_INFORMATION pi;
+            if (CreateProcessW(exePath, (LPWSTR)args.c_str(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+                // Suspends local sub-thread blocking inherently on the background Watchdog physically natively
+                WaitForSingleObject(pi.hProcess, INFINITE); 
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+            }
+            Sleep(100); 
+        }
+        return 0;
+    }, NULL, 0, NULL);
 
     // 6) Sleep-friendly Event Loop (0% CPU overhead)
     MSG msg;
@@ -1271,6 +1613,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 
     // Teardown
     if (g_hEventHook) UnhookWinEvent(g_hEventHook);
+    if (g_hOwnerWnd) DestroyWindow(g_hOwnerWnd);
     if (g_hwMonitor) {
         delete g_hwMonitor;
         g_hwMonitor = nullptr;
