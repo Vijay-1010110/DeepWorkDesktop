@@ -42,6 +42,12 @@ int g_notifyFrames = 0;
 ULONG_PTR g_gdiplusToken;
 HWINEVENTHOOK g_hEventHook = NULL;
 FocusEngine* g_focusEngine = nullptr;
+
+HWND g_hDashboardWnd = NULL;
+bool g_dashboardVisible = false;
+int g_dashboardActiveTab = 1; // 0=Today, 1=7D, 2=30D, 3=All Time
+void DrawDashboardWidget(HWND hWnd);
+void ToggleDashboard();
 // -------------------------------------------------------------------------
 // Hardware Monitor Class
 // -------------------------------------------------------------------------
@@ -485,13 +491,254 @@ void DrawNotifyWidget(HWND hWnd, const WCHAR* msg) {
 // -------------------------------------------------------------------------
 // Focus & Analytics Widget Window
 // -------------------------------------------------------------------------
+
+void ToggleDashboard() {
+    g_dashboardVisible = !g_dashboardVisible;
+    if (g_dashboardVisible && g_hDashboardWnd) {
+        DrawDashboardWidget(g_hDashboardWnd);
+        ShowWindow(g_hDashboardWnd, SW_SHOW);
+        SetWindowPos(g_hDashboardWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    } else if (g_hDashboardWnd) {
+        ShowWindow(g_hDashboardWnd, SW_HIDE);
+    }
+}
+
 LRESULT CALLBACK FocusWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message == WM_LBUTTONUP) {
+        int x = (int)(short)LOWORD(lParam);
+        int y = (int)(short)HIWORD(lParam);
+        if (x >= 20 && x <= 380 && y >= 140 && y <= 240) {
+            ToggleDashboard();
+            return 0;
+        }
+    }
+    
     if (message == WM_NCHITTEST) {
         LRESULT hit = DefWindowProc(hWnd, message, wParam, lParam);
-        if (hit == HTCLIENT) return HTCAPTION;
+        int sx = (int)(short)LOWORD(lParam);
+        int sy = (int)(short)HIWORD(lParam);
+        POINT pt = { sx, sy };
+        ScreenToClient(hWnd, &pt);
+        
+        if (pt.x >= 20 && pt.x <= 380 && pt.y >= 140 && pt.y <= 240) {
+            return HTCLIENT; // Allow click interaction natively
+        }
+        
+        if (hit == HTCLIENT) return HTCAPTION; // Everywhere else is grab-and-drag
         return hit;
     }
     return DefWindowProc(hWnd, message, wParam, lParam);
+}
+
+// -------------------------------------------------------------------------
+// Telemetry Dashboard Window
+// -------------------------------------------------------------------------
+LRESULT CALLBACK DashboardWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message == WM_LBUTTONUP) {
+        int x = (int)(short)LOWORD(lParam);
+        int y = (int)(short)HIWORD(lParam);
+        
+        if (y >= 20 && y <= 60) {
+            // Close button gracefully intercepted natively before generic tabs block it
+            if (x >= 740 && x <= 780) {
+                ToggleDashboard();
+                return 0; 
+            }
+            
+            if (x >= 20 && x <= 180) g_dashboardActiveTab = 0;
+            else if (x >= 190 && x <= 350) g_dashboardActiveTab = 1;
+            else if (x >= 360 && x <= 520) g_dashboardActiveTab = 2;
+            else if (x >= 530 && x <= 690) g_dashboardActiveTab = 3;
+            
+            DrawDashboardWidget(hWnd);
+            return 0;
+        }
+    }
+    
+    if (message == WM_NCHITTEST) {
+        LRESULT hit = DefWindowProc(hWnd, message, wParam, lParam);
+        int sx = (int)(short)LOWORD(lParam);
+        int sy = (int)(short)HIWORD(lParam);
+        POINT pt = { sx, sy };
+        ScreenToClient(hWnd, &pt);
+        
+        if (pt.y >= 20 && pt.y <= 60) return HTCLIENT; // Lock top header panel strictly to internal UI elements natively
+        
+        if (hit == HTCLIENT) return HTCAPTION; // Retain desktop dragging physics elsewhere
+        return hit;
+    }
+    return DefWindowProc(hWnd, message, wParam, lParam);
+}
+
+void DrawDashboardWidget(HWND hWnd) {
+    int width = 800; int height = 600;
+    HDC hdcScreen = GetDC(NULL);
+    HDC hdcMem = CreateCompatibleDC(hdcScreen);
+    HBITMAP hBitmap = CreateCompatibleBitmap(hdcScreen, width, height);
+    HBITMAP hOldBitmap = (HBITMAP)SelectObject(hdcMem, hBitmap);
+    
+    {
+        Graphics graphics(hdcMem);
+        graphics.SetSmoothingMode(SmoothingModeAntiAlias);
+        graphics.Clear(Color(0,0,0,0));
+        
+        RectF panelRect(0, 0, (float)width, (float)height);
+        GraphicsPath panelPath;
+        AddRoundRect(&panelPath, panelRect, 20.0f);
+        SolidBrush bgBrush(Color(245, 10, 12, 18));
+        graphics.FillPath(&bgBrush, &panelPath);
+        
+        FontFamily defaultFamily(L"Segoe UI");
+        FontFamily* useTitleFamily = g_fontFamilyTitle ? g_fontFamilyTitle : &defaultFamily;
+        FontFamily* useItemFamily = g_fontFamilyItem ? g_fontFamilyItem : &defaultFamily;
+        Gdiplus::Font fontTitle(useTitleFamily, 16, FontStyleBold, UnitPixel);
+        Gdiplus::Font fontTab(useTitleFamily, 14, FontStyleBold, UnitPixel);
+        Gdiplus::Font fontItem(useItemFamily, 13, FontStyleRegular, UnitPixel);
+        
+        SolidBrush redBrush(Color(255, 255, 50, 50));
+        graphics.DrawString(L"X", -1, &fontTitle, PointF(750.0f, 25.0f), &redBrush);
+        
+        const WCHAR* tabs[] = { L"TODAY", L"PAST 7 DAYS", L"PAST 30 DAYS", L"ALL TIME" };
+        for(int i=0; i<4; i++) {
+            float tx = 20.0f + (i * 170.0f);
+            float ty = 20.0f;
+            RectF tabRect(tx, ty, 160.0f, 40.0f);
+            
+            GraphicsPath tabPath;
+            AddRoundRect(&tabPath, tabRect, 8.0f);
+            
+            if (g_dashboardActiveTab == i) {
+                SolidBrush activeBrush(Color(255, 100, 255, 200));
+                graphics.FillPath(&activeBrush, &tabPath);
+                SolidBrush textBrush(Color(255, 0, 0, 0));
+                StringFormat fmt; fmt.SetAlignment(StringAlignmentCenter); fmt.SetLineAlignment(StringAlignmentCenter);
+                graphics.DrawString(tabs[i], -1, &fontTab, tabRect, &fmt, &textBrush);
+            } else {
+                SolidBrush inactiveBrush(Color(100, 50, 50, 50));
+                graphics.FillPath(&inactiveBrush, &tabPath);
+                SolidBrush textBrush(Color(200, 255, 255, 255));
+                StringFormat fmt; fmt.SetAlignment(StringAlignmentCenter); fmt.SetLineAlignment(StringAlignmentCenter);
+                graphics.DrawString(tabs[i], -1, &fontTab, tabRect, &fmt, &textBrush);
+            }
+        }
+        
+        // Native Data Fusion Algorithm
+        int totalAggregatedSeconds = 0;
+        std::unordered_map<std::wstring, int> fusedMap;
+        
+        if (g_focusEngine) {
+            std::vector<std::wstring> targetDates;
+            int daysBack = 0;
+            if (g_dashboardActiveTab == 0) daysBack = 1;
+            else if (g_dashboardActiveTab == 1) daysBack = 7;
+            else if (g_dashboardActiveTab == 2) daysBack = 30;
+            else if (g_dashboardActiveTab == 3) daysBack = 3650; // max 10 years visually
+            
+            auto now = std::chrono::system_clock::now();
+            for(int d=0; d<daysBack; d++) {
+                auto targetTime = now - std::chrono::hours(24 * d);
+                time_t t = std::chrono::system_clock::to_time_t(targetTime);
+                tm lt; localtime_s(&lt, &t);
+                std::wstringstream wss; wss << std::put_time(&lt, L"%Y-%m-%d");
+                targetDates.push_back(wss.str());
+            }
+            
+            for (const auto& dStr : targetDates) {
+                if (dStr == g_focusEngine->lastKnownDate) {
+                    totalAggregatedSeconds += g_focusEngine->totalActiveScreenTimeSeconds;
+                    for (const auto& kv : g_focusEngine->usageTracker) fusedMap[kv.first] += kv.second;
+                } else {
+                    std::wstring shPath = g_focusEngine->GetHistoryPath(dStr);
+                    FILE* f;
+                    if (_wfopen_s(&f, shPath.c_str(), L"rb") == 0) {
+                        fseek(f, 0, SEEK_END); long fSize = ftell(f); rewind(f);
+                        if (fSize >= (sizeof(int)*3 + sizeof(size_t) + sizeof(unsigned int))) {
+                            std::vector<uint8_t> buf(fSize);
+                            if (fread(buf.data(), 1, fSize, f) == fSize) {
+                                const char key[] = "DEEPWORK_FOCUS_SECURE_KEY_2026!";
+                                size_t keyLen = sizeof(key) - 1;
+                                for (size_t i=0; i<buf.size(); i++) buf[i] ^= key[i % keyLen];
+                                
+                                unsigned int fileChecksum = 0;
+                                memcpy(&fileChecksum, buf.data() + buf.size() - sizeof(unsigned int), sizeof(unsigned int));
+                                unsigned int computed = 0;
+                                for(size_t i=0; i<buf.size() - sizeof(unsigned int); i++) computed += buf[i];
+                                
+                                if (computed == fileChecksum) {
+                                    size_t off = 0;
+                                    auto pInt = [&]()->int { int v=0; if (off+sizeof(int)<=buf.size()) {memcpy(&v,buf.data()+off,sizeof(int)); off+=sizeof(int);} return v; };
+                                    auto pSize = [&]()->size_t { size_t v=0; if (off+sizeof(size_t)<=buf.size()) {memcpy(&v,buf.data()+off,sizeof(size_t)); off+=sizeof(size_t);} return v; };
+                                    auto pTime = [&]()->time_t { time_t v=0; if (off+sizeof(time_t)<=buf.size()) {memcpy(&v,buf.data()+off,sizeof(time_t)); off+=sizeof(time_t);} return v; }; // Skip var
+                                    
+                                    pInt(); pInt(); // Skip Token Banks natively
+                                    totalAggregatedSeconds += pInt(); 
+                                    pTime(); // Skip Time bound
+                                    
+                                    size_t mSize = pSize();
+                                    if (mSize <= 10000) {
+                                        for (size_t i=0; i<mSize; i++) {
+                                            size_t sLen = pSize();
+                                            if (sLen > 0 && sLen <= 5000 && off + sLen*sizeof(wchar_t) <= buf.size() - sizeof(unsigned int)) {
+                                                std::wstring kStr; kStr.resize(sLen);
+                                                memcpy(&kStr[0], buf.data()+off, sLen*sizeof(wchar_t));
+                                                off += sLen*sizeof(wchar_t);
+                                                fusedMap[kStr] += pInt();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        fclose(f);
+                    }
+                }
+            }
+        }
+        
+        // Native GDI+ Output Generation
+        float dashY = 90.0f;
+        SolidBrush whiteBrush(Color(255, 255, 255, 255));
+        
+        int totHr = totalAggregatedSeconds / 3600;
+        int totMn = (totalAggregatedSeconds % 3600) / 60;
+        WCHAR tbuf[256]; swprintf_s(tbuf, L"Cumulative Screen Time Database:   %d:%02d hr", totHr, totMn);
+        
+        graphics.DrawString(tbuf, -1, &fontTitle, PointF(20.0f, dashY), &whiteBrush);
+        dashY += 40.0f;
+        
+        std::vector<std::pair<std::wstring, int>> fVec(fusedMap.begin(), fusedMap.end());
+        std::sort(fVec.begin(), fVec.end(), [](const auto& a, const auto& b){ return a.second > b.second; });
+        if (fVec.size() > 10) fVec.resize(10); 
+        
+        float colX = 20.0f;
+        int drawn = 0;
+        for (const auto& item : fVec) {
+            if (drawn == 5) { colX = 410.0f; dashY -= (5 * 70.0f); }
+            
+            float pct = totalAggregatedSeconds > 0 ? ((float)item.second / totalAggregatedSeconds) * 100.0f : 0.0f;
+            int h = item.second / 3600; int m = (item.second % 3600) / 60;
+            swprintf_s(tbuf, L"%d:%02d hr", h, m);
+            
+            std::wstring label = item.first;
+            if (label.length() > 30) label = label.substr(0, 27) + L"...";
+            
+            FocusState cat = g_focusEngine ? g_focusEngine->GetCategoryForName(item.first) : NEUTRAL;
+            Color startCol, endCol;
+            if (cat == EARNING_GOOD) { startCol = Color(255, 50, 150, 255); endCol = Color(255, 50, 200, 255); }
+            else if (cat == SPENDING_ENTERTAINMENT) { startCol = Color(255, 255, 120, 50); endCol = Color(255, 255, 150, 50); }
+            else if (cat == SPENDING_NSFW) { startCol = Color(255, 255, 0, 150); endCol = Color(255, 255, 0, 255); }
+            else { startCol = Color(255, 150, 150, 150); endCol = Color(255, 100, 100, 100); }
+            
+            DrawProgressBar(graphics, &fontItem, label.c_str(), tbuf, colX, dashY, 360.0f, pct, startCol, endCol, 12.0f);
+            dashY += 70.0f;
+            drawn++;
+        }
+    }
+    
+    POINT ptSrc = {0,0}; SIZE sz = {width, height};
+    BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    UpdateLayeredWindow(hWnd, hdcScreen, NULL, &sz, hdcMem, &ptSrc, 0, &blend, ULW_ALPHA);
+    SelectObject(hdcMem, hOldBitmap); DeleteObject(hBitmap); DeleteDC(hdcMem); ReleaseDC(NULL, hdcScreen);
 }
 
 void DrawFocusWidget(HWND hWnd) {
@@ -837,17 +1084,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 if (g_hDotWnd && g_focusEngine) DrawDotIndicator(g_hDotWnd, g_focusEngine->currentState);
                 DrawWidget(hWnd);
                 if (g_hFocusWidgetWnd) DrawFocusWidget(g_hFocusWidgetWnd);
+                if (g_hDashboardWnd && g_dashboardVisible) DrawDashboardWidget(g_hDashboardWnd);
             }
             break;
-
-        case WM_WINDOWPOSCHANGING: {
-            // 3) Strip SWP_HIDEWINDOW to aggressively block DWM from natively hiding our widget
-            WINDOWPOS* pos = (WINDOWPOS*)lParam;
-            if (pos->flags & SWP_HIDEWINDOW) {
-                pos->flags &= ~SWP_HIDEWINDOW;
-            }
-            break;
-        }
 
         // We override mouse clicks so you can drag the window if needed (optional bonus)
         case WM_NCHITTEST: {
@@ -944,6 +1183,15 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     fwc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassW(&fwc);
 
+    // Register Telemetry Dashboard Window Class
+    const wchar_t DASHBOARD_CLASS_NAME[] = L"DashboardClass";
+    WNDCLASSW dashc = { 0 };
+    dashc.lpfnWndProc = DashboardWndProc;
+    dashc.hInstance = hInstance;
+    dashc.lpszClassName = DASHBOARD_CLASS_NAME;
+    dashc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    RegisterClassW(&dashc);
+
     // 3) Create floating, unowned window (Parent = NULL)
     // WS_EX_LAYERED: Required for UpdateLayeredWindow
     // WS_EX_TOOLWINDOW: Hides from Alt-Tab
@@ -987,6 +1235,17 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         L"Focus Analytics",
         WS_POPUP,
         focusX, 470, 400, 480,   // Window height extended slightly for subtle divider separator element
+        NULL, NULL, hInstance, NULL
+    );
+
+    // Instantiate hidden Dashboard Telemetry window natively properly centered
+    g_hDashboardWnd = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW, // allow physical UI interaction
+        DASHBOARD_CLASS_NAME,
+        L"Telemetry Dashboard",
+        WS_POPUP,
+        screenWidth / 2 - 400, GetSystemMetrics(SM_CYSCREEN) / 2 - 300, 
+        800, 600,
         NULL, NULL, hInstance, NULL
     );
 

@@ -10,6 +10,10 @@
 #include <unordered_map>
 #include <deque>
 #include <ctime>
+#include <chrono>
+#include <sstream>
+#include <iomanip>
+#include <shlobj.h>
 
 struct TickAction {
     int tokenDelta;
@@ -70,11 +74,34 @@ public:
     std::wstring saveFilePath;
     int ticksSinceLastSave = 0;
     time_t lastNsfwRefreshTime = 0;
+    
+    std::wstring lastKnownDate;
+
+    std::wstring GetDateString() {
+        auto now = std::chrono::system_clock::now();
+        time_t timeNow = std::chrono::system_clock::to_time_t(now);
+        tm localTime;
+        localtime_s(&localTime, &timeNow);
+        std::wstringstream wss;
+        wss << std::put_time(&localTime, L"%Y-%m-%d");
+        return wss.str();
+    }
+
+    std::wstring GetHistoryPath(const std::wstring& dateStr) {
+        wchar_t path[MAX_PATH];
+        if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, path))) {
+            std::wstring historyPath = std::wstring(path) + L"\\DeepWorkDesktop\\history";
+            CreateDirectoryW(historyPath.c_str(), NULL);
+            return historyPath + L"\\" + dateStr + L".bin";
+        }
+        return L"";
+    }
 
     FocusEngine(const std::wstring& path) {
         saveFilePath = path;
         CoCreateInstance(CLSID_CUIAutomation, NULL, CLSCTX_INPROC_SERVER, IID_IUIAutomation, (void**)&pUIAutomation);
         LoadState();
+        lastKnownDate = GetDateString();
         
         // 14-Day Strict Bi-Weekly Reset Bound natively
         time_t now = time(NULL);
@@ -137,6 +164,16 @@ public:
         if (_wfopen_s(&f, saveFilePath.c_str(), L"wb") == 0) {
             fwrite(buffer.data(), 1, buffer.size(), f);
             fclose(f);
+        }
+        
+        // Output perfectly encrypted clone natively to Daily Shard History Database Log
+        std::wstring currentHistoryPath = GetHistoryPath(lastKnownDate);
+        if (!currentHistoryPath.empty()) {
+            FILE* hf;
+            if (_wfopen_s(&hf, currentHistoryPath.c_str(), L"wb") == 0) {
+                fwrite(buffer.data(), 1, buffer.size(), hf);
+                fclose(hf);
+            }
         }
     }
 
@@ -316,6 +353,17 @@ public:
         if (GetCursorPos(&pt)) {
             mouseHistory.push_back(pt);
             if (mouseHistory.size() > 60) mouseHistory.pop_front();
+        }
+
+        // -------------------------------------------------------------
+        // MIDNIGHT DATABASE ROLLOVER / SHARDING
+        // -------------------------------------------------------------
+        std::wstring todayStr = GetDateString();
+        if (todayStr != lastKnownDate) {
+            totalActiveScreenTimeSeconds = 0;
+            usageTracker.clear();
+            lastKnownDate = todayStr;
+            SaveState(); // Instantly serialize and construct the new blank physical Shard natively
         }
 
         // -------------------------------------------------------------

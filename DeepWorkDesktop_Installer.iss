@@ -3,12 +3,12 @@ AppName=DeepWork Desktop
 AppVersion=1.0.0
 DefaultDirName={autopf}\DeepWork Desktop
 DefaultGroupName=DeepWork Desktop
-UninstallDisplayIcon={app}\DesktopWidget.exe
+UninstallDisplayIcon={app}\DeepWorkDesktop.exe
 Compression=lzma2
 SolidCompression=yes
 OutputDir=.\Installer
 OutputBaseFilename=DeepWorkDesktop_Setup_v1.0
-PrivilegesRequired=highest
+PrivilegesRequired=admin
 SetupIconFile=DesktopWidget\DesktopWidget.ico
 
 [Files]
